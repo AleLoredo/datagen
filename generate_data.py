@@ -76,7 +76,7 @@ def format_sql_value(val: Any, engine: str) -> str:
     escaped_val = str(val).replace("'", "''")
     return f"'{escaped_val}'"
 
-def parse_schema(sql_content: str, table_name: str) -> List[Dict[str, str]]:
+def parse_schema(sql_content: str, table_name: str) -> List[Dict[str, Any]]:
     """
     Parses the SQL content to find the table schema.
     """
@@ -88,22 +88,57 @@ def parse_schema(sql_content: str, table_name: str) -> List[Dict[str, str]]:
             expressions = sqlglot.parse(sql_content, read=dialect)
             for expression in expressions:
                 if isinstance(expression, exp.Create) and expression.this.arg_key == 'table':
-                    if expression.this.this.name.lower() == table_name.lower():
+                    # Support both simple "table" and "db.table" or "[table]"
+                    found_table_name = expression.this.this.name.lower()
+                    if found_table_name == table_name.lower():
                         columns = []
                         for schema_def in expression.this.expressions:
                             if isinstance(schema_def, exp.ColumnDef):
                                 col_name = schema_def.this.name
                                 col_type = schema_def.kind.sql(dialect)
-                                columns.append({'name': col_name, 'type': col_type})
+                                
+                                # Detect identity / auto-increment
+                                is_identity = False
+                                for constraint in schema_def.constraints:
+                                    constraint_sql = constraint.sql(dialect).upper()
+                                    if 'IDENTITY' in constraint_sql or 'AUTO_INCREMENT' in constraint_sql or 'SERIAL' in constraint_sql:
+                                        is_identity = True
+                                        break
+                                
+                                columns.append({
+                                    'name': col_name, 
+                                    'type': col_type, 
+                                    'is_identity': is_identity
+                                })
                         return columns
         except Exception:
             continue
             
     # Regex fallback if sqlglot fails
-    pattern = rf"CREATE\s+TABLE\s+(?:\"|'|`|)?{re.escape(table_name)}(?:\"|'|`|)?\s*\((.*?)\);"
+    pattern = rf"CREATE\s+TABLE\s+(?:\"|'|`|\[)?{re.escape(table_name)}(?:\"|'|`|\])?\s*\((.*?)\);"
     match = re.search(pattern, sql_content, re.IGNORECASE | re.DOTALL)
     if match:
-        col_definitions = match.group(1).split(',')
+        col_content = match.group(1)
+        
+        # Split by comma but ignore commas inside parentheses (like IDENTITY(1,1) or DECIMAL(10,2))
+        col_definitions = []
+        current_col = []
+        paren_depth = 0
+        for char in col_content:
+            if char == '(':
+                paren_depth += 1
+                current_col.append(char)
+            elif char == ')':
+                paren_depth -= 1
+                current_col.append(char)
+            elif char == ',' and paren_depth == 0:
+                col_definitions.append(''.join(current_col).strip())
+                current_col = []
+            else:
+                current_col.append(char)
+        if current_col:
+            col_definitions.append(''.join(current_col).strip())
+            
         columns = []
         for line in col_definitions:
             line = line.strip()
@@ -111,9 +146,14 @@ def parse_schema(sql_content: str, table_name: str) -> List[Dict[str, str]]:
                 continue
             parts = line.split()
             if parts:
-                col_name = parts[0].strip('"`\'')
+                col_name = parts[0].strip('"`\'[]')
                 col_type = parts[1] if len(parts) > 1 else 'TEXT'
-                columns.append({'name': col_name, 'type': col_type})
+                is_identity = 'IDENTITY' in line.upper() or 'AUTO_INCREMENT' in line.upper() or 'SERIAL' in line.upper()
+                columns.append({
+                    'name': col_name, 
+                    'type': col_type, 
+                    'is_identity': is_identity
+                })
         return columns
 
     return []
@@ -135,14 +175,19 @@ def main():
     with open(args.script, 'r') as f:
         sql_content = f.read()
 
-    columns = parse_schema(sql_content, args.table)
-    if not columns:
+    all_columns = parse_schema(sql_content, args.table)
+    if not all_columns:
         print(f"Error: Could not find table '{args.table}' in the script.")
         sys.exit(1)
 
+    # Filter out identity columns
+    columns = [c for c in all_columns if not c['is_identity']]
+    identity_columns = [c for c in all_columns if c['is_identity']]
+
     print(f"Detected columns for table '{args.table}':")
-    for col in columns:
-        print(f"  - {col['name']} ({col['type']})")
+    for col in all_columns:
+        status = "[SKIP - IDENTITY]" if col['is_identity'] else ""
+        print(f"  - {col['name']} ({col['type']}) {status}")
 
     generic = Generic(locale=Locale.EN)
     providers = {col['name']: map_column_to_mimesis(col['name'], col['type'], generic) for col in columns}
@@ -151,7 +196,10 @@ def main():
     
     with open(output_file, 'w') as f:
         f.write(f"-- Synthetic data for table {args.table}\n")
-        f.write(f"-- Generated for engine: {args.engine}\n\n")
+        f.write(f"-- Generated for engine: {args.engine}\n")
+        if identity_columns:
+            f.write(f"-- Skipped identity columns: {', '.join([c['name'] for c in identity_columns])}\n")
+        f.write("\n")
 
         for _ in range(args.rows):
             row_data = {name: provider() for name, provider in providers.items()}

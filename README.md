@@ -4,6 +4,13 @@ This script generates a SQL dump file with synthetic data for a specific databas
 
 ## Installation
 
+Creation of a python virtual environment is recommended:
+
+```bash
+python -m venv venv
+source venv/bin/activate
+```
+
 The script requires `mimesis` and `sqlglot`. You can install them using:
 
 ```bash
@@ -29,6 +36,11 @@ python generate_data.py --script <PATH_TO_SQL_SCRIPT> --engine <ENGINE_TYPE> --t
 
 ```bash
 python generate_data.py --script schema.sql --engine postgresql --table users --rows 100
+```
+
+### Example 2:
+```bash
+python generate_data.py --script seed.sql --engine mssql --table usuarios --rows 100 --output seed100.sql
 ```
 
 ## Features:
