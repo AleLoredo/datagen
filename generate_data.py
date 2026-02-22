@@ -43,13 +43,19 @@ def map_column_to_mimesis(col_name: str, col_type: str, generic: Generic) -> Any
     if 'company' in name:
         return generic.finance.company
     if 'date' in name or 'created_at' in name or 'updated_at' in name:
-        return lambda: generic.datetime.datetime().isoformat()
+        # Standard SQL format instead of ISO format with 'T'
+        return lambda: generic.datetime.datetime().strftime('%Y-%m-%d %H:%M:%S')
     if 'price' in name or 'amount' in name or 'salary' in name:
         return lambda: generic.numeric.decimal_number(10, 2)
     
+    # Heuristics for Foreign Keys often prefixed with 'id_'
+    if name.startswith('id_') and name != 'id_usuario' and name != 'id':
+        # Default to a safe range (1-10) for common lookups like roles, statuses, etc.
+        return lambda: generic.numeric.integer_number(1, 10)
+
     # Type-based mapping if name doesn't match
     if 'int' in t:
-        return lambda: generic.numeric.integer_number(1, 1000000)
+        return lambda: generic.numeric.integer_number(1, 100000)
     if 'float' in t or 'decimal' in t or 'numeric' in t or 'double' in t:
         return lambda: generic.numeric.float_number(1.0, 1000000.0, 2)
     if 'char' in t or 'text' in t:
@@ -158,6 +164,25 @@ def parse_schema(sql_content: str, table_name: str) -> List[Dict[str, Any]]:
 
     return []
 
+def extract_database_name(sql_content: str, engine: str) -> str:
+    """
+    Attempts to extract the database name from the SQL content.
+    Looks for USE statement or CREATE DATABASE statement.
+    """
+    # Look for USE statement
+    use_pattern = r"USE\s+([a-zA-Z0-9_\[\]`\"']+)"
+    match = re.search(use_pattern, sql_content, re.IGNORECASE)
+    if match:
+        return match.group(1).strip('[]"`\'')
+        
+    # Look for CREATE DATABASE statement
+    create_pattern = r"CREATE\s+DATABASE\s+([a-zA-Z0-9_\[\]`\"']+)"
+    match = re.search(create_pattern, sql_content, re.IGNORECASE)
+    if match:
+        return match.group(1).strip('[]"`\'')
+        
+    return None
+
 def main():
     parser = argparse.ArgumentParser(description="Generate synthetic data for a database table.")
     parser.add_argument("--script", required=True, help="Path to the database creation script (SQL file).")
@@ -165,6 +190,7 @@ def main():
     parser.add_argument("--table", required=True, help="Name of the table to generate data for.")
     parser.add_argument("--rows", type=int, required=True, help="Number of rows to generate.")
     parser.add_argument("--output", help="Path to the output dump file.")
+    parser.add_argument("--db", help="Target database name (if not provided, script attempts to detect it).")
 
     args = parser.parse_args()
 
@@ -179,6 +205,10 @@ def main():
     if not all_columns:
         print(f"Error: Could not find table '{args.table}' in the script.")
         sys.exit(1)
+        
+    db_name = args.db or extract_database_name(sql_content, args.engine)
+    if db_name:
+        print(f"Detected database context: '{db_name}'")
 
     # Filter out identity columns
     columns = [c for c in all_columns if not c['is_identity']]
@@ -200,6 +230,16 @@ def main():
         if identity_columns:
             f.write(f"-- Skipped identity columns: {', '.join([c['name'] for c in identity_columns])}\n")
         f.write("\n")
+        
+        if db_name:
+            if args.engine == 'mssql':
+                f.write(f"USE [{db_name}];\nGO\n\n")
+            else:
+                f.write(f"USE {db_name};\n\n")
+                
+        if args.engine == 'mssql':
+            f.write("-- Disable constraints for synthetic data insertion\n")
+            f.write("EXEC sp_msforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT ALL';\nGO\n\n")
 
         for _ in range(args.rows):
             row_data = {name: provider() for name, provider in providers.items()}
@@ -212,6 +252,10 @@ def main():
             
         if args.engine == 'oracle':
             f.write("COMMIT;\n")
+            
+        if args.engine == 'mssql':
+            f.write("\n-- Re-enable constraints\n")
+            f.write("EXEC sp_msforeachtable 'ALTER TABLE ? WITH CHECK CHECK CONSTRAINT ALL';\nGO\n")
 
     print(f"\nSuccessfully generated {args.rows} rows in '{output_file}'.")
 
